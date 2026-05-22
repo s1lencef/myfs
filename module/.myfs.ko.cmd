@@ -1,0 +1,1 @@
+savedcmd_/home/s1lencef/myfs/module/myfs.ko := x86_64-linux-gnu-ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T arch/x86/module.lds -o /home/s1lencef/myfs/module/myfs.ko /home/s1lencef/myfs/module/myfs.o /home/s1lencef/myfs/module/myfs.mod.o /home/s1lencef/myfs/module/.module-common.o
