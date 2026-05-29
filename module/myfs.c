@@ -83,7 +83,8 @@ MODULE_PARM_DESC(max_file_sectors, "File size in sectors (M)");
  * геометрии из суперблока.
  */
 struct myfs_sb_info {
-	/* Геометрия (из суперблока, продублирована для удобства): */
+	u32 sector_size;        /* реальный размер сектора устройства в байтах */
+
 	u64 total_sectors;
 	u64 sb_copy_offset;
 	u32 max_name_len;
@@ -91,7 +92,7 @@ struct myfs_sb_info {
 	u64 first_data_sector;
 	u64 file_count;
 
-	struct mutex io_lock;       /* сериализация операций ввода-вывода */
+	struct mutex io_lock;
 };
 
 /*
@@ -99,8 +100,8 @@ struct myfs_sb_info {
  * вычисляется положение файла на диске.
  */
 struct myfs_inode_info {
-	u64 file_index;             /* 0..file_count-1 */
-	struct inode vfs_inode;     /* встроенный VFS-inode */
+	u64 file_index;
+	struct inode vfs_inode;
 };
 
 static inline struct myfs_inode_info *MYFS_I(struct inode *inode)
@@ -146,13 +147,14 @@ static u32 myfs_data_checksum(const void *data, u32 len)
  */
 static int myfs_read_sector(struct super_block *sb, u64 sector, void *buf)
 {
+	struct myfs_sb_info *si = sb->s_fs_info;
 	struct buffer_head *bh;
 
 	bh = sb_bread(sb, sector);
 	if (!bh)
 		return -EIO;
 
-	memcpy(buf, bh->b_data, MYFS_SECTOR_SIZE);
+	memcpy(buf, bh->b_data, si->sector_size);
 	brelse(bh);
 	return 0;
 }
@@ -160,13 +162,14 @@ static int myfs_read_sector(struct super_block *sb, u64 sector, void *buf)
 /* Запись одного сектора (512 байт) из буфера buf на устройство. */
 static int myfs_write_sector(struct super_block *sb, u64 sector, const void *buf)
 {
+	struct myfs_sb_info *si = sb->s_fs_info;
 	struct buffer_head *bh;
 
 	bh = sb_bread(sb, sector);
 	if (!bh)
 		return -EIO;
 
-	memcpy(bh->b_data, buf, MYFS_SECTOR_SIZE);
+	memcpy(bh->b_data, buf, si->sector_size);
 	mark_buffer_dirty(bh);
 	/* sync_dirty_buffer гарантирует, что данные ушли на устройство —
 	 * для учебной ФС важна предсказуемость, а не максимальная скорость. */
@@ -202,7 +205,7 @@ static int myfs_read_file_header(struct super_block *sb, u64 index,
 	u64 first;
 	int ret;
 
-	sector = kmalloc(MYFS_SECTOR_SIZE, GFP_KERNEL);
+	sector = kmalloc(si->sector_size, GFP_KERNEL);
 	if (!sector)
 		return -ENOMEM;
 
@@ -227,12 +230,12 @@ static int myfs_write_file_header(struct super_block *sb, u64 index,
 	u64 first;
 	int ret;
 
-	sector = kmalloc(MYFS_SECTOR_SIZE, GFP_KERNEL);
+	sector = kmalloc(si->sector_size, GFP_KERNEL);
 	if (!sector)
 		return -ENOMEM;
 
 	first = myfs_file_first_sector(si, index);
-	ret = myfs_read_sector(sb, first, sector);   /* читаем, чтобы не потерять данные */
+	ret = myfs_read_sector(sb, first, sector);
 	if (ret) {
 		kfree(sector);
 		return ret;
@@ -256,7 +259,7 @@ static int myfs_read_file_data(struct super_block *sb, u64 index,
 	struct myfs_sb_info *si = sb->s_fs_info;
 	struct myfs_file_header hdr;
 	u8 *filebuf;
-	size_t filebytes = (size_t)si->file_size_sectors * MYFS_SECTOR_SIZE;
+	size_t filebytes = (size_t)si->file_size_sectors * si->sector_size;
 	u64 first = myfs_file_first_sector(si, index);
 	u32 i;
 	int ret;
@@ -280,7 +283,7 @@ static int myfs_read_file_data(struct super_block *sb, u64 index,
 	/* Считываем все секторы файла подряд. */
 	for (i = 0; i < si->file_size_sectors; i++) {
 		ret = myfs_read_sector(sb, first + i,
-				       filebuf + (size_t)i * MYFS_SECTOR_SIZE);
+				       filebuf + (size_t)i * si->sector_size);
 		if (ret) {
 			vfree(filebuf);
 			return ret;
@@ -306,8 +309,9 @@ static int myfs_write_file_data(struct super_block *sb, u64 index,
 	struct myfs_sb_info *si = sb->s_fs_info;
 	struct myfs_file_header hdr;
 	u8 *filebuf;
-	size_t filebytes = (size_t)si->file_size_sectors * MYFS_SECTOR_SIZE;
-	size_t payload_cap = MYFS_FILE_PAYLOAD(si->file_size_sectors);
+	size_t filebytes = (size_t)si->file_size_sectors * si->sector_size;
+	/* payload = весь объём файла минус заголовок */
+	size_t payload_cap = filebytes - sizeof(struct myfs_file_header);
 	u64 first = myfs_file_first_sector(si, index);
 	u32 new_len;
 	u32 i;
@@ -333,7 +337,7 @@ static int myfs_write_file_data(struct super_block *sb, u64 index,
 	 * данные вне модифицируемого диапазона). */
 	for (i = 0; i < si->file_size_sectors; i++) {
 		ret = myfs_read_sector(sb, first + i,
-				       filebuf + (size_t)i * MYFS_SECTOR_SIZE);
+				       filebuf + (size_t)i * si->sector_size);
 		if (ret) {
 			vfree(filebuf);
 			return ret;
@@ -358,7 +362,7 @@ static int myfs_write_file_data(struct super_block *sb, u64 index,
 	/* Пишем все секторы файла обратно. */
 	for (i = 0; i < si->file_size_sectors; i++) {
 		ret = myfs_write_sector(sb, first + i,
-					filebuf + (size_t)i * MYFS_SECTOR_SIZE);
+					filebuf + (size_t)i * si->sector_size);
 		if (ret) {
 			vfree(filebuf);
 			return ret;
@@ -381,15 +385,15 @@ static ssize_t myfs_read(struct file *filp, char __user *buf,
 	struct super_block *sb = inode->i_sb;
 	struct myfs_sb_info *si = sb->s_fs_info;
 	struct myfs_inode_info *mi = MYFS_I(inode);
+	size_t payload = (size_t)si->file_size_sectors * si->sector_size
+			 - sizeof(struct myfs_file_header);
 	void *kbuf;
 	int ret;
 
 	if (count == 0)
 		return 0;
-	/* Ограничим единичное чтение ёмкостью файла, чтобы vmalloc не был
-	 * чрезмерным при огромном count. */
-	if (count > MYFS_FILE_PAYLOAD(si->file_size_sectors))
-		count = MYFS_FILE_PAYLOAD(si->file_size_sectors);
+	if (count > payload)
+		count = payload;
 
 	kbuf = vmalloc(count);
 	if (!kbuf)
@@ -401,7 +405,7 @@ static ssize_t myfs_read(struct file *filp, char __user *buf,
 
 	if (ret <= 0) {
 		vfree(kbuf);
-		return ret;  /* 0 => EOF, либо отрицательная ошибка */
+		return ret;
 	}
 
 	if (copy_to_user(buf, kbuf, ret)) {
@@ -422,14 +426,15 @@ static ssize_t myfs_write(struct file *filp, const char __user *buf,
 	struct super_block *sb = inode->i_sb;
 	struct myfs_sb_info *si = sb->s_fs_info;
 	struct myfs_inode_info *mi = MYFS_I(inode);
+	size_t payload = (size_t)si->file_size_sectors * si->sector_size
+			 - sizeof(struct myfs_file_header);
 	void *kbuf;
 	int ret;
 
 	if (count == 0)
 		return 0;
-	/* Ограничим единичную запись ёмкостью файла. */
-	if (count > MYFS_FILE_PAYLOAD(si->file_size_sectors))
-		count = MYFS_FILE_PAYLOAD(si->file_size_sectors);
+	if (count > payload)
+		count = payload;
 
 	kbuf = vmalloc(count);
 	if (!kbuf)
@@ -493,17 +498,24 @@ static long myfs_ioc_erase_fs(struct super_block *sb)
 	u8 *zero;
 	int ret;
 
-	zero = kzalloc(MYFS_SECTOR_SIZE, GFP_KERNEL);
+	zero = kzalloc(si->sector_size, GFP_KERNEL);
 	if (!zero)
 		return -ENOMEM;
 
-	/* Первая копия (нулевой сектор по нашему соглашению — sb_offset 0). */
+	/* Затираем первичную копию суперблока. */
 	ret = myfs_write_sector(sb, sb_offset, zero);
 	if (ret)
 		goto out;
 
 	/* Вторая копия. */
 	ret = myfs_write_sector(sb, si->sb_copy_offset, zero);
+	if (ret)
+		goto out;
+
+	invalidate_bdev(sb->s_bdev);
+	sb->s_flags |= SB_RDONLY;
+	pr_warn("myfs: filesystem erased, remounted read-only\n");
+
 out:
 	kfree(zero);
 	return ret;
@@ -595,7 +607,7 @@ static long myfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ret = myfs_ioc_get_map(sb, arg);
 		break;
 	default:
-		ret = -ENOTTY;  /* неизвестная команда */
+		ret = -ENOTTY;
 		break;
 	}
 	mutex_unlock(&si->io_lock);
@@ -616,7 +628,7 @@ static const struct inode_operations myfs_file_inode_ops = {
 
 
 /* ===========================================================================
- *  Операции каталога: показываем все файлы в корне
+ *  Операции каталога
  * ======================================================================== */
 
 /* Вперёд объявим конструктор inode'а для файла. */
@@ -742,7 +754,7 @@ static struct inode *myfs_make_root_inode(struct super_block *sb)
 }
 
 /* ===========================================================================
- *  Суперблок: чтение/запись/проверка, инициализация (форматирование)
+ *  Суперблок: чтение/запись/проверка, форматирование
  * ======================================================================== */
 
 /* Записать суперблок в обе копии (через нашу посекторную запись). */
@@ -753,7 +765,7 @@ static int myfs_write_super_copies(struct super_block *sb,
 	u8 *sector;
 	int ret;
 
-	sector = kzalloc(MYFS_SECTOR_SIZE, GFP_KERNEL);
+	sector = kzalloc(si->sector_size, GFP_KERNEL);
 	if (!sector)
 		return -ENOMEM;
 
@@ -778,11 +790,12 @@ out:
 static int myfs_read_super_at(struct super_block *sb, u64 sector,
 			      struct myfs_super_block *out)
 {
+	struct myfs_sb_info *si = sb->s_fs_info;
 	u8 *buf;
 	struct myfs_super_block *dsb;
 	int ret;
 
-	buf = kmalloc(MYFS_SECTOR_SIZE, GFP_KERNEL);
+	buf = kmalloc(si->sector_size, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
@@ -792,19 +805,9 @@ static int myfs_read_super_at(struct super_block *sb, u64 sector,
 
 	dsb = (struct myfs_super_block *)buf;
 
-	if (dsb->magic != MYFS_MAGIC) {
-		ret = -EINVAL;
-		goto out;
-	}
-	if (dsb->version != MYFS_VERSION) {
-		ret = -EINVAL;
-		goto out;
-	}
-	/* Проверка целостности через контрольную сумму. */
-	if (dsb->checksum != myfs_sb_checksum(dsb)) {
-		ret = -EUCLEAN;  /* данные повреждены */
-		goto out;
-	}
+	if (dsb->magic != MYFS_MAGIC) { ret = -EINVAL; goto out; }
+	if (dsb->version != MYFS_VERSION) { ret = -EINVAL; goto out; }
+	if (dsb->checksum != myfs_sb_checksum(dsb)) { ret = -EUCLEAN; goto out; }
 
 	*out = *dsb;
 	ret = 0;
@@ -953,10 +956,17 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
 	mutex_init(&si->io_lock);
 	sb->s_fs_info = si;
 
-	/* Настраиваем размер блока ФС = 512 байт (наш «сектор»).
-	 * sb_set_blocksize работает с уже установленным sb->s_bdev. */
-	if (!sb_set_blocksize(sb, MYFS_SECTOR_SIZE)) {
-		pr_err("myfs: cannot set blocksize %u\n", MYFS_SECTOR_SIZE);
+	si->sector_size = (u32)bdev_logical_block_size(bdev);
+	if (si->sector_size < sizeof(struct myfs_super_block)) {
+		pr_err("myfs: sector size %u too small for superblock\n",
+		       si->sector_size);
+		ret = -EINVAL;
+		goto err_free;
+	}
+	pr_info("myfs: device sector size = %u bytes\n", si->sector_size);
+
+	if (!sb_set_blocksize(sb, si->sector_size)) {
+		pr_err("myfs: cannot set blocksize %u\n", si->sector_size);
 		ret = -EINVAL;
 		goto err_free;
 	}
@@ -966,7 +976,7 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	/* Размер устройства в секторах. */
 	dev_bytes = bdev_nr_bytes(bdev);
-	si->total_sectors = (u64)dev_bytes / MYFS_SECTOR_SIZE;
+	si->total_sectors = (u64)dev_bytes / si->sector_size;
 
 	/* Заполняем геометрию из параметров (на случай форматирования). */
 	si->sb_copy_offset = sb_copy_offset;
@@ -1019,8 +1029,33 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
 		pr_info("myfs: mounted existing FS, %llu files\n",
 			(unsigned long long)si->file_count);
 	} else {
-		/* Валидной ФС нет — форматируем. */
-		pr_info("myfs: no valid FS found, formatting device\n");
+
+		u64 probe_sector;
+		u8 *probe_buf;
+		struct myfs_file_header *probe_hdr;
+		bool looks_like_myfs = false;
+
+		probe_sector = max_t(u64, sb_offset, sb_copy_offset) + 1;
+		probe_buf = kmalloc(si->sector_size, GFP_KERNEL);
+		if (probe_buf) {
+			if (probe_sector < si->total_sectors &&
+			    myfs_read_sector(sb, probe_sector, probe_buf) == 0) {
+				probe_hdr = (struct myfs_file_header *)probe_buf;
+				if (probe_hdr->magic == MYFS_MAGIC)
+					looks_like_myfs = true;
+			}
+			kfree(probe_buf);
+		}
+
+		if (looks_like_myfs) {
+			pr_err("myfs: both superblocks corrupted but file data "
+			       "looks intact — refusing to format to prevent "
+			       "data loss. Wipe the device manually first.\n");
+			ret = -EUCLEAN;
+			goto err_free;
+		}
+
+		pr_info("myfs: no valid FS found on clean device, formatting\n");
 		ret = myfs_format(sb);
 		if (ret)
 			goto err_free;
@@ -1059,7 +1094,7 @@ static struct dentry *myfs_mount(struct file_system_type *fs_type,
 {
 	if (device_name && device_name[0] != '\0' &&
 	    strcmp(device_name, dev_name) != 0) {
-		pr_warn("myfs: mount device '%s' differs from module param device_name='%s'\n",
+		pr_warn("myfs: mount device '%s' differs from module param '%s'\n",
 			dev_name, device_name);
 	}
 	return mount_bdev(fs_type, flags, dev_name, data, myfs_fill_super);
@@ -1069,7 +1104,7 @@ static struct file_system_type myfs_fs_type = {
 	.owner    = THIS_MODULE,
 	.name     = MYFS_FS_NAME,
 	.mount    = myfs_mount,
-	.kill_sb  = kill_block_super,  /* парная функция для mount_bdev */
+	.kill_sb  = kill_block_super,
 	.fs_flags = FS_REQUIRES_DEV,
 };
 
@@ -1094,8 +1129,8 @@ static int __init myfs_init(void)
 		return ret;
 	}
 
-	pr_info("myfs: module loaded (device=%s, sb_offset=%u, sb_copy_offset=%u, "
-		"max_name_len=%u, max_file_sectors=%u)\n",
+	pr_info("myfs: module loaded (device=%s, sb_offset=%u, "
+		"sb_copy_offset=%u, max_name_len=%u, max_file_sectors=%u)\n",
 		device_name, sb_offset, sb_copy_offset,
 		max_name_len, max_file_sectors);
 	return 0;
